@@ -3,10 +3,10 @@ import mysql.connector # type: ignore
 def create_connection():
     try:
         connection = mysql.connector.connect(
-        user = "studentdba",
-        password = "Please Change Me",
-        host = "csci-cs418-25.dhcp.bsu.edu",
-        database = "University")
+        user = "",
+        password = "",
+        host = "",
+        database = "")
 
         if connection.is_connected():
             print("Connected to MySQL database")

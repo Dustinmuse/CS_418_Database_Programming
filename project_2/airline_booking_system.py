@@ -1,9 +1,12 @@
+import os
 import mysql.connector
 from mysql.connector import Error
 import requests
 import time
 from datetime import datetime
+from dotenv import load_dotenv
 
+load_dotenv(dotenv_path='c:\\CS418_Python\\fullstack_airline_booking_system\\mysql.env')
 
 def create_connection():
     """
@@ -12,10 +15,10 @@ def create_connection():
     """
     try:
         connection = mysql.connector.connect(
-            user="root",
-            password="",
-            host="localhost",
-            database="airline_booking"
+            user=os.getenv('MYSQL_USER'),
+            password=os.getenv('MYSQL_PASSWORD'),
+            host=os.getenv('MYSQL_HOST'),
+            database=os.getenv('MYSQL_DATABASE')
         )
         print("Connected to the airline database successfully!")
         return connection
@@ -41,8 +44,9 @@ def create_tables(connection):
         );""",
         """CREATE TABLE IF NOT EXISTS Airports (
             airport_id INT AUTO_INCREMENT PRIMARY KEY,
-            airport_name VARCHAR(100) NOT NULL,
-            location VARCHAR(100) NOT NULL
+            airport_name VARCHAR(100),
+            airport_code VARCHAR(10) UNIQUE NOT NULL,
+            location VARCHAR(100)
         );""",
         """CREATE TABLE IF NOT EXISTS Flights (
             flight_id INT AUTO_INCREMENT PRIMARY KEY,
@@ -155,64 +159,63 @@ def delete_booking(connection, booking_id):
         cursor.close()
 
 
-def insert_default_flights(connection):
-    """
-    Insert default airports and flights into the database if they do not already exist.
-    """
-    airports = [
-        ("JFK International", "New York, USA"),
-        ("LAX International", "Los Angeles, USA"),
-        ("O'Hare International", "Chicago, USA"),
-        ("Spaxial International", "Indianapolis, USA")
-    ]
-
+def insert_flights_from_api(connection, flights_data):
     try:
         cursor = connection.cursor()
 
-        # Insert default airports (if they don’t exist)
-        for airport in airports:
-            cursor.execute("""
-                INSERT INTO Airports (airport_name, location)
-                SELECT * FROM (SELECT %s AS airport_name, %s AS location) AS temp
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM Airports WHERE airport_name = %s AND location = %s
-                ) LIMIT 1
-            """, (airport[0], airport[1], airport[0], airport[1]))
+        # Insert airports first (to avoid FK constraint issues)
+        for flight in flights_data:
+            departure_airport = flight.get("departure_airport")
+            arrival_airport = flight.get("arrival_airport")
+
+            # Handle missing airport codes
+            if not departure_airport:
+                # If missing departure airport, skip logging it here to avoid excessive output
+                departure_airport = "UNKNOWN"  # Or some default value
+            if not arrival_airport:
+                # If missing arrival airport, skip logging it here to avoid excessive output
+                arrival_airport = "UNKNOWN"  # Or some default value
+
+            # Insert airports for both departure and arrival (even if they are "UNKNOWN")
+            for airport_code in [departure_airport, arrival_airport]:
+                cursor.execute("""
+                    INSERT INTO Airports (airport_code)
+                    SELECT * FROM (SELECT %s) AS temp
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM Airports WHERE airport_code = %s
+                    ) LIMIT 1;
+                """, (airport_code, airport_code))
 
         connection.commit()
-        print("Default airports inserted successfully!")
 
-        # Fetch airport IDs
-        cursor.execute("SELECT airport_id, airport_name FROM Airports")
-        airport_dict = {name: airport_id for airport_id, name in cursor.fetchall()}
+        # Fetch airport IDs into a dict
+        cursor.execute("SELECT airport_id, airport_code FROM Airports")
+        airport_id_map = {code: id_ for id_, code in cursor.fetchall()}
 
-        # Define flights using actual airport IDs
-        flights = [
-            ("FL1001", airport_dict["JFK International"], airport_dict["LAX International"], "2025-04-01 08:00:00",
-             "2025-04-01 12:00:00"),
-            ("FL1002", airport_dict["LAX International"], airport_dict["O'Hare International"], "2025-04-02 10:00:00",
-             "2025-04-02 14:00:00"),
-            ("FL1003", airport_dict["O'Hare International"], airport_dict["JFK International"], "2025-04-03 15:00:00",
-             "2025-04-03 19:00:00"),
-            ("FL1004", airport_dict["Spaxial International"], airport_dict["JFK International"], "2025-04-04 19:00:00",
-             "2025-04-04 23:00:00")
-        ]
+        # Insert flights
+        for flight in flights_data:
+            departure_id = airport_id_map.get(flight["departure_airport"])
+            arrival_id = airport_id_map.get(flight["arrival_airport"])
 
-        # Insert default flights
-        for flight in flights:
-            cursor.execute("""
-                INSERT IGNORE INTO Flights (flight_number, departure_airport, arrival_airport, departure_time, arrival_time)
-                VALUES (%s, %s, %s, %s, %s)
-            """, flight)
+            if departure_id and arrival_id:
+                cursor.execute("""
+                    INSERT IGNORE INTO Flights (flight_number, departure_airport, arrival_airport, departure_time, arrival_time)
+                    VALUES (%s, %s, %s, %s, %s)
+                """, (
+                    flight["flight_number"],
+                    departure_id,
+                    arrival_id,
+                    flight["departure_time"],
+                    flight["arrival_time"]
+                ))
 
         connection.commit()
-        print("Default flights inserted successfully!")
+        print("Flights and airports inserted successfully!")
 
     except Error as e:
-        print(f"Error inserting default airports or flights: {e}")
+        print(f"Error inserting flights: {e}")
     finally:
         cursor.close()
-
 
 def view_available_flights(connection):
     """
@@ -243,30 +246,38 @@ def view_available_flights(connection):
         cursor.close()
 
 def get_flights_data():
-
-    # Define time range (last hour)
-    end_time = int(time.time())  # Current timestamp
-    start_time = end_time - 3600  # One hour ago
-
-    # OpenSky API URL for flights
-    url = f"https://opensky-network.org/api/flights/all?begin={start_time}&end={end_time}"
+    #current_time = int(time.time())
+    #start_time = current_time - 3600
+    url = f"https://opensky-network.org/api/states/all"
 
     response = requests.get(url)
     data = response.json()
 
-    flights = []  # List to store flight details
+    flights = []
 
-    for flight in data:
-        if flight["callsign"]:  # Ensure flight number exists
+    if isinstance(data, list):
+        for flight in data:
+            callsign = flight.get("callsign")
+            first_seen = flight.get("firstSeen")
+            last_seen = flight.get("lastSeen")
+            departure_airport = flight.get("estDepartureAirport")
+            arrival_airport = flight.get("estArrivalAirport")
+
+            # Comment out or remove the print statement below to stop printing airport details
+            # print(f"Departure Airport: {departure_airport}, Arrival Airport: {arrival_airport}")
+
             flight_info = {
-                "flight_number": flight["callsign"].strip(),
-                "departure_time": datetime.fromtimestamp(flight["firstSeen"]).strftime('%Y-%m-%d %H:%M:%S'),
-                "arrival_time": datetime.fromtimestamp(flight["lastSeen"]).strftime('%Y-%m-%d %H:%M:%S')
+                "flight_number": callsign.strip(),
+                "departure_airport": departure_airport,
+                "arrival_airport": arrival_airport,
+                "departure_time": datetime.fromtimestamp(first_seen).strftime('%Y-%m-%d %H:%M:%S'),
+                "arrival_time": datetime.fromtimestamp(last_seen).strftime('%Y-%m-%d %H:%M:%S') if last_seen else "N/A"
             }
             flights.append(flight_info)
+    else:
+        print("Data is not in the expected format!")
 
-    print(flights)
-
+    return flights
 
 def main():
     """
@@ -279,7 +290,11 @@ def main():
         return
 
     create_tables(connection)
-    insert_default_flights(connection)  # Ensure default flights exist
+    # Get live flights from the API
+    flights_data = get_flights_data()
+
+    # Insert fetched flights into the database
+    insert_flights_from_api(connection, flights_data)
 
     while True:
         user_type = input("Are you a new or existing user? (new/existing): ").strip().lower()
@@ -361,4 +376,4 @@ def main():
 
 
 if __name__ == "__main__":
-    get_flights_data()
+    main()
